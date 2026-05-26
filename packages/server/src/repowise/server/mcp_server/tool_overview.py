@@ -14,6 +14,10 @@ from repowise.core.persistence.crud import (
     get_kg_layers as _get_kg_layers,
     get_kg_tour_steps as _get_kg_tour_steps,
 )
+from repowise.core.generation.onboarding.slots import (
+    ONBOARDING_ORDER,
+    PROMOTED_SLOTS,
+)
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import (
     GitMetadata,
@@ -414,6 +418,40 @@ async def get_overview(repo: str | None = None) -> dict:
             architecture["tour_available"] = bool(kg_tour)
             architecture["tour_step_count"] = len(kg_tour)
 
+        # E. Reading order — the canonical onboarding spine, mirrored for agents
+        # so they can walk the wiki in the same order a human would (§ dual
+        # audience). Only slots that actually produced a page are listed.
+        ro_result = await session.execute(
+            select(Page).where(
+                Page.repository_id == repository.id,
+                Page.page_type.in_(
+                    ["onboarding", *PROMOTED_SLOTS.keys()]
+                ),
+            )
+        )
+        slot_to_page: dict[str, Page] = {}
+        for p in ro_result.scalars().all():
+            if p.page_type == "onboarding":
+                slot = (p.target_path or "").rsplit("/", 1)[-1]
+            else:
+                slot = PROMOTED_SLOTS.get(p.page_type, "")
+            if slot and slot not in slot_to_page:
+                slot_to_page[slot] = p
+        reading_order: list[dict[str, Any]] = []
+        for slot in ONBOARDING_ORDER:
+            p = slot_to_page.get(slot)
+            if p is None:
+                continue
+            reading_order.append(
+                {
+                    "order": len(reading_order) + 1,
+                    "slot": slot,
+                    "title": p.title,
+                    "page_id": p.id,
+                    "target_path": p.target_path,
+                }
+            )
+
         # Older indexes persisted titles like "Repository Overview: repo" because
         # repo_name was not passed through to generate_repo_overview. Substitute
         # the actual repo name back in so the response is useful without reindex.
@@ -473,6 +511,48 @@ async def get_overview(repo: str | None = None) -> dict:
 
         if architecture:
             result["architecture"] = architecture
+
+        if reading_order:
+            result["reading_order"] = reading_order
+            result["reading_order_hint"] = (
+                "Canonical onboarding sequence — read these page_ids in order "
+                "via get_context/get_symbol to understand the repo the way a "
+                "new contributor would."
+            )
+
+        # Topology-driven guided tour — the ordered, page-by-page walk derived
+        # from the import graph (entry points first, then inward, infra last).
+        # Persisted on the repo_overview page metadata at generation time.
+        if overview_page:
+            from repowise.core.generation.models import compute_page_id
+
+            try:
+                ov_meta = json.loads(overview_page.metadata_json or "{}")
+            except (json.JSONDecodeError, TypeError):
+                ov_meta = {}
+            tour = ov_meta.get("guided_tour") or []
+            if tour:
+                result["guided_tour"] = [
+                    {
+                        "order": s.get("order"),
+                        "title": s.get("title"),
+                        "kind": s.get("kind"),
+                        "reason": s.get("reason"),
+                        "target_path": s.get("target_path"),
+                        "page_id": compute_page_id(
+                            s.get("page_type", "file_page"), s.get("target_path", "")
+                        ),
+                    }
+                    for s in tour
+                ]
+                result["guided_tour_hint"] = (
+                    "Topology-ordered walk of the codebase: read these page_ids "
+                    "in order — entry points first, then the files they import, "
+                    "with infrastructure last. Each step builds on the previous."
+                )
+            layer_order = ov_meta.get("layer_order") or []
+            if layer_order:
+                result.setdefault("architecture", {})["layer_order"] = layer_order
 
         # Append workspace context footer when in workspace mode
         ws_footer = _build_workspace_footer()

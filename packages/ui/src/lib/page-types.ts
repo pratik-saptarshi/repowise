@@ -9,6 +9,7 @@ import {
   RefreshCw,
   Server,
   Compass,
+  Layers,
 } from "lucide-react";
 import type { DocPage } from "@repowise-dev/types/docs";
 
@@ -20,6 +21,7 @@ export interface PageTypeConfig {
 export const PAGE_TYPE_CONFIG: Record<string, PageTypeConfig> = {
   repo_overview: { label: "Overview", icon: Globe },
   architecture_diagram: { label: "Knowledge Graph", icon: LayoutGrid },
+  layer_page: { label: "Layer", icon: Layers },
   module_page: { label: "Module", icon: FolderOpen },
   symbol_spotlight: { label: "Symbol", icon: Sparkles },
   file_page: { label: "File", icon: FileText },
@@ -54,6 +56,7 @@ export function getPageTypeLabel(pageType: string): string {
 export const ONBOARDING_ORDER = [
   "project_overview",
   "architecture_guide",
+  "guided_tour",
   "getting_started",
   "codebase_map",
   "key_concepts",
@@ -67,6 +70,7 @@ export type OnboardingSlot = (typeof ONBOARDING_ORDER)[number];
 export const ONBOARDING_SLOT_TITLES: Record<OnboardingSlot, string> = {
   project_overview: "Project Overview",
   architecture_guide: "Architecture Guide",
+  guided_tour: "Guided Tour",
   getting_started: "Getting Started",
   codebase_map: "Codebase Map",
   key_concepts: "Key Concepts",

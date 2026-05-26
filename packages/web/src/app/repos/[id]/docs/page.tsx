@@ -1,12 +1,15 @@
 "use client";
 
-import { use, useMemo, useState } from "react";
+import { use, useCallback, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
-import { Download, FolderArchive, Loader2 } from "lucide-react";
+import { Download, FolderArchive, Loader2, Search } from "lucide-react";
 import { Button } from "@repowise-dev/ui/ui/button";
 import { FirstFiveFiles, type FirstFiveFile } from "@repowise-dev/ui/onboarding/first-five-files";
+import { DocsCommandPalette } from "@repowise-dev/ui/docs/command-palette";
 import { DocsExplorer } from "@/components/docs/docs-explorer";
 import { listAllPages, listPages } from "@/lib/api/pages";
+import { search as searchPages } from "@/lib/api/search";
 import { getGraph } from "@/lib/api/graph";
 import type { DocPage } from "@repowise-dev/types/docs";
 import { downloadTextFile } from "@/lib/utils/download";
@@ -19,6 +22,18 @@ export default function DocsPage({
 }) {
   const { id: repoId } = use(params);
   const [isExporting, setIsExporting] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
+  const openPage = useCallback(
+    (pageId: string) => {
+      const next = new URLSearchParams(searchParams.toString());
+      next.set("page", pageId);
+      router.replace(`?${next.toString()}`, { scroll: false });
+    },
+    [router, searchParams],
+  );
 
   const { data: graphData } = useSWR<GraphExportResponse>(
     `graph:${repoId}`,
@@ -30,6 +45,20 @@ export default function DocsPage({
     `docs-list:${repoId}`,
     () => listPages(repoId, { limit: 1000 }),
     { revalidateOnFocus: false },
+  );
+
+  // Server-backed search for the ⌘K palette: hit the semantic/full-text
+  // endpoint, then map results back to the loaded page objects so selection
+  // behaves identically to a client-side hit. Unknown ids (rare) are dropped.
+  const searchFn = useCallback(
+    async (q: string) => {
+      const results = await searchPages(q, { repo_id: repoId, limit: 30 });
+      const byId = new Map((docPages ?? []).map((p) => [p.id, p]));
+      return results
+        .map((r) => byId.get(r.page_id))
+        .filter((p): p is DocPage => p !== undefined);
+    },
+    [repoId, docPages],
   );
 
   const pageByPath = useMemo(() => {
@@ -87,6 +116,16 @@ export default function DocsPage({
           </p>
         </div>
         <div className="flex gap-2 shrink-0">
+          <button
+            onClick={() => setSearchOpen(true)}
+            className="flex items-center gap-2 rounded-md border border-[var(--color-border-default)] bg-[var(--color-bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-secondary)]"
+          >
+            <Search className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Search</span>
+            <kbd className="hidden rounded border border-[var(--color-border-default)] px-1 py-0.5 text-[10px] sm:inline">
+              ⌘K
+            </kbd>
+          </button>
           <Button
             variant="outline"
             size="sm"
@@ -111,14 +150,16 @@ export default function DocsPage({
 
       {startHere.length > 0 && (
         <div className="px-4 sm:px-6 pt-3">
-          <details className="rounded-lg border border-[var(--color-border-default)] bg-[var(--color-bg-surface)]">
-            <summary className="cursor-pointer list-none px-4 py-2.5 text-sm font-medium text-[var(--color-text-primary)] flex items-center gap-2 hover:bg-[var(--color-bg-elevated)] transition-colors">
+          <div className="rounded-lg border border-[var(--color-border-accent)] bg-[var(--color-accent-muted)]/30">
+            <div className="flex items-center gap-2 px-4 pt-3 pb-1">
               <span className="text-[var(--color-accent-primary)]">✨</span>
-              Start here
-              <span className="text-[10px] font-normal text-[var(--color-text-tertiary)] uppercase tracking-wider">
-                first {startHere.length} files to read
+              <span className="text-sm font-medium text-[var(--color-text-primary)]">
+                Start here
               </span>
-            </summary>
+              <span className="text-[10px] font-normal text-[var(--color-text-tertiary)] uppercase tracking-wider">
+                the first {startHere.length} files to read
+              </span>
+            </div>
             <div className="px-3 pb-3 pt-1">
               <FirstFiveFiles
                 files={startHere}
@@ -131,7 +172,7 @@ export default function DocsPage({
                 }}
               />
             </div>
-          </details>
+          </div>
         </div>
       )}
 
@@ -139,6 +180,15 @@ export default function DocsPage({
       <div className="flex-1 min-h-0">
         <DocsExplorer repoId={repoId} />
       </div>
+
+      {/* ⌘K full-text command palette over loaded pages */}
+      <DocsCommandPalette
+        pages={docPages ?? []}
+        open={searchOpen}
+        onOpenChange={setSearchOpen}
+        onSelect={(p) => openPage(p.id)}
+        searchFn={searchFn}
+      />
     </div>
   );
 }
