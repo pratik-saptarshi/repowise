@@ -1,4 +1,4 @@
-﻿"""MCP Tool 4: get_why — intent archaeology and decision search."""
+"""MCP Tool 4: get_why — intent archaeology and decision search."""
 
 from __future__ import annotations
 
@@ -10,11 +10,13 @@ from typing import Any
 
 from sqlalchemy import select
 
+from repowise.core.analysis.decision_semantic_match import DECISION_VECTOR_PREFIX
 from repowise.core.persistence.database import get_session
 from repowise.core.persistence.models import (
     DecisionRecord,
     GitMetadata,
 )
+from repowise.core.registry import mcp_tool_registry as mcp
 from repowise.server.mcp_server._helpers import (
     _build_origin_story,
     _compute_alignment,
@@ -25,7 +27,6 @@ from repowise.server.mcp_server._helpers import (
     _unsupported_repo_all,
 )
 from repowise.server.mcp_server._meta import build_meta as _build_meta
-from repowise.core.registry import mcp_tool_registry as mcp
 
 
 @mcp.tool()
@@ -76,16 +77,18 @@ async def get_why(
                 for d in res.scalars().all():
                     text = f"{d.title} {d.decision} {d.rationale} {d.context}".lower()
                     if any(w in text for w in query.lower().split()):
-                        merged.append({
-                            "repo": ctx.alias,
-                            "id": d.id,
-                            "title": d.title,
-                            "status": d.status,
-                            "decision": d.decision,
-                            "rationale": d.rationale,
-                            "source": d.source,
-                            "confidence": d.confidence,
-                        })
+                        merged.append(
+                            {
+                                "repo": ctx.alias,
+                                "id": d.id,
+                                "title": d.title,
+                                "status": d.status,
+                                "decision": d.decision,
+                                "rationale": d.rationale,
+                                "source": d.source,
+                                "confidence": d.confidence,
+                            }
+                        )
         return {
             "mode": "search",
             "query": query,
@@ -135,6 +138,7 @@ async def get_why(
                     for d in proposed[:10]
                 ],
                 "ungoverned_hotspots": ungoverned[:15],
+                "conflicts": health.get("conflicts", [])[:10],
                 "_meta": _build_meta(repository=repository),
             }
 
@@ -167,11 +171,16 @@ async def get_why(
             )
             all_git_meta = all_git_res.scalars().all()
 
+            from repowise.core.persistence.decision_graph import build_lineage_chain
+
             governing = []
             for d in all_decisions:
                 affected_files = json.loads(d.affected_files_json)
                 affected_modules = json.loads(d.affected_modules_json)
                 if query in affected_files or query in affected_modules:
+                    # Walk supersedes/refines back to roots so the answer is a
+                    # lineage chain (sessions → JWT → OAuth2), not a flat list.
+                    lineage = await build_lineage_chain(session, d.id)
                     governing.append(
                         {
                             "id": d.id,
@@ -186,6 +195,7 @@ async def get_why(
                             "source": d.source,
                             "confidence": d.confidence,
                             "staleness_score": d.staleness_score,
+                            "lineage": lineage if len(lineage) > 1 else [],
                         }
                     )
 
@@ -270,10 +280,15 @@ async def get_why(
     scored_decisions.sort(key=lambda t: t[0], reverse=True)
     keyword_matches = [d for _, d in scored_decisions[:8]]
 
-    # Semantic search over decision vector store
+    # Semantic search over the shared page store, filtered to the decision: namespace.
+    # Over-fetch because decisions are a small slice of a page-dominated store.
     decision_results = []
     with contextlib.suppress(Exception):
-        decision_results = await ctx.decision_store.search(query, limit=5)
+        if ctx.vector_store is not None:
+            _raw = await ctx.vector_store.search(query, limit=50)
+            decision_results = [
+                r for r in _raw if getattr(r, "page_id", "").startswith(DECISION_VECTOR_PREFIX)
+            ][:5]
 
     # Semantic search over documentation
     doc_results = []
@@ -282,6 +297,18 @@ async def get_why(
     except Exception:
         with contextlib.suppress(Exception):
             doc_results = await ctx.fts.search(query, limit=3)
+
+    # Lineage for the keyword matches: walk supersedes/refines back to roots so
+    # a "why is X structured this way?" answer renders the chain, not a flat list.
+    from repowise.core.persistence.decision_graph import build_lineage_chain
+
+    lineage_by_id: dict[str, list[dict]] = {}
+    if keyword_matches:
+        async with get_session(ctx.session_factory) as session3:
+            for d in keyword_matches:
+                chain = await build_lineage_chain(session3, d.id)
+                if len(chain) > 1:
+                    lineage_by_id[d.id] = chain
 
     # Merge keyword matches with semantic results (dedup by ID)
     seen_ids: set[str] = set()
@@ -301,15 +328,18 @@ async def get_why(
                     "affected_files": json.loads(d.affected_files_json),
                     "source": d.source,
                     "confidence": d.confidence,
+                    "lineage": lineage_by_id.get(d.id, []),
                 }
             )
 
     for r in decision_results:
-        if r.page_id not in seen_ids:
-            seen_ids.add(r.page_id)
+        # Strip the "decision:" prefix so the returned id matches the SQL primary key.
+        real_id = r.page_id[len(DECISION_VECTOR_PREFIX) :]
+        if real_id not in seen_ids:
+            seen_ids.add(real_id)
             merged_decisions.append(
                 {
-                    "id": r.page_id,
+                    "id": real_id,
                     "title": r.title,
                     "snippet": r.snippet,
                     "relevance_score": r.score,
@@ -545,9 +575,13 @@ async def _run_git_log(
             if safe_stem and len(safe_stem) >= 3:
                 proc2 = subprocess.run(
                     [
-                        "git", "log", "--all",
-                        "--grep", safe_stem,
-                        "--format=%H\t%an\t%ai\t%s", "-10",
+                        "git",
+                        "log",
+                        "--all",
+                        "--grep",
+                        safe_stem,
+                        "--format=%H\t%an\t%ai\t%s",
+                        "-10",
                         "--",  # end of options — prevent argument injection
                     ],
                     cwd=repo_path,

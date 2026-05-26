@@ -237,7 +237,10 @@ class GraphEdge(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "repository_id", "source_node_id", "target_node_id", "edge_type",
+            "repository_id",
+            "source_node_id",
+            "target_node_id",
+            "edge_type",
             name="uq_graph_edge_typed",
         ),
     )
@@ -441,6 +444,14 @@ class DecisionRecord(Base):
     evidence_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
 
+    # Verification (anti-hallucination gate, Phase 1D). Aggregate over the
+    # decision's evidence rows: "exact" if any headline field is a verbatim
+    # quote of its source span, "fuzzy" if only token-overlap matched,
+    # "unverified" if nothing could be grounded.
+    verification: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unverified"
+    )  # exact | fuzzy | unverified
+
     # Staleness
     last_code_change: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -453,6 +464,148 @@ class DecisionRecord(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_now_utc, onupdate=_now_utc
+    )
+
+
+class DecisionEvidence(Base):
+    """One verbatim provenance row supporting a :class:`DecisionRecord`.
+
+    Provenance accretes rather than overwrites: when two sources describe the
+    same decision they merge into one ``DecisionRecord`` with N evidence rows.
+    The decision's headline fields come from the highest-``source_rank`` row;
+    its confidence is a function of the best rank plus corroboration count.
+    """
+
+    __tablename__ = "decision_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "decision_id",
+            "source",
+            "evidence_file",
+            "evidence_commit",
+            name="uq_decision_evidence",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    decision_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("decision_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    # Provenance — which source attested to this decision, and how trusted it is.
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_rank: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # The verbatim span this evidence was drawn from.
+    evidence_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence_line: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    evidence_commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_quote: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # Per-evidence confidence + substring-gate verdict.
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    verification: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unverified"
+    )  # exact | fuzzy | unverified
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+
+
+class DecisionEdge(Base):
+    """A typed, directed edge between two :class:`DecisionRecord` rows.
+
+    The decision graph (Phase 3): decisions are nodes, time/relationships are
+    edges. ``kind`` is one of:
+
+    - ``supersedes``     — ``src`` replaces ``dst`` (e.g. JWT supersedes sessions).
+    - ``refines``        — ``src`` narrows/extends ``dst`` without reversing it.
+    - ``relates_to``     — same topic, no ordering implied.
+    - ``conflicts_with`` — two *active* decisions that contradict; neither
+      clearly supersedes the other (a governance smell surfaced in health).
+
+    Edges accrete (propose-don't-clobber): a detected supersession always
+    records the edge; the older decision's status is only auto-flipped to
+    ``superseded`` above a high confidence threshold, leaving everything else a
+    reviewable proposal.
+    """
+
+    __tablename__ = "decision_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "src_decision_id",
+            "dst_decision_id",
+            "kind",
+            name="uq_decision_edge",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    src_decision_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("decision_records.id", ondelete="CASCADE"), nullable=False
+    )
+    dst_decision_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("decision_records.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False
+    )  # supersedes | refines | relates_to | conflicts_with
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=0.5)
+    evidence: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
+    )
+
+
+class DecisionNodeLink(Base):
+    """A first-class decision→code link (file or module governed by a decision).
+
+    Promotes the linkage that ``DecisionRecord.affected_files_json`` /
+    ``affected_modules_json`` hold as a denormalized cache into rows that are
+    indexed on both ``decision_id`` and ``node_id`` — so the graph can be walked
+    in either direction (file → governing decisions, decision → governed code).
+    Kept in sync from the JSON arrays on every ``bulk_upsert_decisions``.
+    """
+
+    __tablename__ = "decision_node_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "decision_id",
+            "node_id",
+            "link_type",
+            name="uq_decision_node_link",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=_new_uuid)
+    repository_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("repositories.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    decision_id: Mapped[str] = mapped_column(
+        String(32),
+        ForeignKey("decision_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    node_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    link_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="file"
+    )  # file | module
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_now_utc
     )
 
 
@@ -499,9 +652,7 @@ class LlmCost(Base):
     repository_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False
     )
-    ts: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=_now_utc
-    )
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now_utc)
     model: Mapped[str] = mapped_column(String(100), nullable=False)
     operation: Mapped[str] = mapped_column(String(50), nullable=False)
     input_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -657,9 +808,7 @@ class CoverageFile(Base):
     )
     ingested_commit_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
-    __table_args__ = (
-        UniqueConstraint("repository_id", "file_path", name="uq_coverage_files"),
-    )
+    __table_args__ = (UniqueConstraint("repository_id", "file_path", name="uq_coverage_files"),)
 
 
 class AnswerCache(Base):
@@ -695,9 +844,7 @@ class AnswerCache(Base):
         DateTime(timezone=True), nullable=False, default=_now_utc
     )
 
-    __table_args__ = (
-        UniqueConstraint("repository_id", "question_hash", name="uq_answer_cache_q"),
-    )
+    __table_args__ = (UniqueConstraint("repository_id", "question_hash", name="uq_answer_cache_q"),)
 
 
 class KnowledgeGraphLayer(Base):

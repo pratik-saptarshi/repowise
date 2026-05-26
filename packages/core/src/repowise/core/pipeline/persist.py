@@ -103,9 +103,7 @@ async def persist_graph_nodes(
     # repos can serve metric reads from SQL without recomputing the NetworkX
     # centrality kernels. Additive to graph_nodes; never changes node rows.
     try:
-        await batch_upsert_graph_metrics(
-            session, repo_id, graph_builder.file_metrics_snapshot()
-        )
+        await batch_upsert_graph_metrics(session, repo_id, graph_builder.file_metrics_snapshot())
     except Exception as exc:  # materialization is non-load-bearing
         logger.warning("graph_metrics_materialize_skipped", error=str(exc))
 
@@ -254,12 +252,51 @@ async def persist_pipeline_result(
             logger.warning("health_snapshot_skipped", error=str(_snap_err))
 
     # ---- Decision records ----------------------------------------------------
+    # Two contributors merge into one upsert: the multi-source extractor
+    # (decision_report) and the Phase-2 LLM-docs harvest (ridden on each
+    # generated page's metadata, already gated at generation time). Folding
+    # them into a single bulk_upsert lets harvested candidates corroborate
+    # extracted decisions (extra evidence row + confidence bump) or stand alone
+    # as low-rank ``proposed`` records awaiting review.
+    decision_dicts: list[dict] = []
     if result.decision_report and result.decision_report.decisions:
-        await bulk_upsert_decisions(
+        decision_dicts.extend(dataclasses.asdict(d) for d in result.decision_report.decisions)
+    if result.generated_pages:
+        for page in result.generated_pages:
+            harvested = page.metadata.get("harvested_decisions")
+            if harvested:
+                decision_dicts.extend(harvested)
+
+    if decision_dicts:
+        # Reuse the run's shared vector store for semantic (paraphrase) dedup
+        # and to make decisions searchable; title dedup still runs when None.
+        store = getattr(result, "vector_store", None)
+        touched_ids = await bulk_upsert_decisions(
             session,
             repo_id,
-            [dataclasses.asdict(d) for d in result.decision_report.decisions],
+            decision_dicts,
+            vector_store=store,
         )
+        # Phase 3B: detect supersession/conflict among the just-upserted
+        # decisions and record typed edges (auto-flipping the older only above
+        # the high-confidence threshold). Heuristic-only here (no provider on
+        # the persist path); the update path adds the gated LLM tiebreaker.
+        if touched_ids and store is not None:
+            try:
+                from repowise.core.analysis.decision_evolution import (
+                    detect_supersessions_and_conflicts,
+                )
+
+                evo = await detect_supersessions_and_conflicts(
+                    session,
+                    repo_id,
+                    touched_ids=touched_ids,
+                    vector_store=store,
+                )
+                if any(evo.values()):
+                    logger.info("decision_supersession_detected", **evo)
+            except Exception as _evo_err:
+                logger.debug("supersession_detection_skipped", error=str(_evo_err))
         # Recompute staleness scores using git metadata.
         if result.git_metadata_list:
             try:
@@ -275,6 +312,38 @@ async def persist_pipeline_result(
                         logger.info("decision_staleness_recomputed", updated=updated)
             except Exception as _stale_err:
                 logger.debug("staleness_scoring_skipped", error=str(_stale_err))
+
+    # ---- Governance findings (additive pass, after decisions are persisted) ----
+    # Runs after bulk_upsert_decisions + detect_supersessions_and_conflicts so
+    # the decision graph is complete. Best-effort — never breaks persist.
+    try:
+        from sqlalchemy import select as _select
+
+        from repowise.core.analysis.health.governance import build_governance_findings
+        from repowise.core.persistence.crud import (
+            get_decision_health_summary,
+            replace_governance_findings,
+        )
+        from repowise.core.persistence.models import DecisionRecord
+
+        _dr_result = await session.execute(
+            _select(DecisionRecord).where(DecisionRecord.repository_id == repo_id)
+        )
+        _decisions = list(_dr_result.scalars().all())
+        _health_summary = await get_decision_health_summary(session, repo_id)
+        _gov_findings = build_governance_findings(
+            health_summary=_health_summary,
+            decisions=_decisions,
+        )
+        await replace_governance_findings(session, repo_id, _gov_findings)
+        if _gov_findings:
+            logger.info(
+                "governance_findings_persisted",
+                repo_id=repo_id,
+                count=len(_gov_findings),
+            )
+    except Exception as _gov_err:
+        logger.debug("governance_findings_skipped", error=str(_gov_err))
 
     # ---- Knowledge graph layers & tour steps -----------------------------------
     kg = getattr(result, "knowledge_graph_result", None)

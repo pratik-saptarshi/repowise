@@ -21,11 +21,15 @@ from typing import Any
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from repowise.core.analysis.decision_provenance import compute_confidence, rank_for_source
+
+from .decision_graph import sync_decision_node_links
 from .models import (
     ChatMessage,
     Conversation,
     CoverageFile,
     DeadCodeFinding,
+    DecisionEvidence,
     DecisionRecord,
     ExternalSystem,
     GenerationJob,
@@ -1210,6 +1214,7 @@ async def upsert_decision(
     evidence_file: str | None = None,
     evidence_line: int | None = None,
     confidence: float = 1.0,
+    verification: str = "unverified",
     last_code_change: datetime | None = None,
     staleness_score: float = 0.0,
     superseded_by: str | None = None,
@@ -1251,6 +1256,7 @@ async def upsert_decision(
         existing.evidence_commits_json = json.dumps(evidence_commits or [])
         existing.evidence_line = evidence_line
         existing.confidence = confidence
+        existing.verification = verification
         existing.last_code_change = last_code_change
         existing.staleness_score = staleness_score
         existing.superseded_by = superseded_by
@@ -1276,6 +1282,7 @@ async def upsert_decision(
         evidence_file=evidence_file,
         evidence_line=evidence_line,
         confidence=confidence,
+        verification=verification,
         last_code_change=last_code_change,
         staleness_score=staleness_score,
         superseded_by=superseded_by,
@@ -1441,67 +1448,287 @@ def _normalize_title(title: str) -> str:
     return t
 
 
+def _evidence_quote(d: dict) -> str:
+    """Pick the verbatim span recorded as this evidence row's source quote.
+
+    Prefers the LLM/parser-supplied ``source_quote``; falls back to the
+    decision/rationale text so an evidence row is never empty.
+    """
+    return (d.get("source_quote") or d.get("decision") or d.get("rationale") or "").strip()
+
+
+async def _upsert_decision_evidence(
+    session: AsyncSession,
+    decision_id: str,
+    *,
+    source: str,
+    source_rank: int,
+    evidence_file: str | None,
+    evidence_line: int | None,
+    evidence_commit: str | None,
+    source_quote: str,
+    confidence: float,
+    verification: str,
+) -> None:
+    """Insert or update one evidence row, idempotent on its natural key.
+
+    Natural key is ``(decision_id, source, evidence_file, evidence_commit)``.
+    NULLs are matched explicitly (SQLite treats NULLs as distinct in a unique
+    constraint), so re-indexing the same source converges instead of
+    duplicating, while an incremental update adds genuinely new evidence.
+    """
+    q = select(DecisionEvidence).where(
+        DecisionEvidence.decision_id == decision_id,
+        DecisionEvidence.source == source,
+    )
+    q = (
+        q.where(DecisionEvidence.evidence_file == evidence_file)
+        if evidence_file is not None
+        else q.where(DecisionEvidence.evidence_file.is_(None))
+    )
+    q = (
+        q.where(DecisionEvidence.evidence_commit == evidence_commit)
+        if evidence_commit is not None
+        else q.where(DecisionEvidence.evidence_commit.is_(None))
+    )
+    existing = (await session.execute(q)).scalar_one_or_none()
+
+    if existing is not None:
+        existing.source_rank = source_rank
+        existing.evidence_line = evidence_line
+        existing.source_quote = source_quote
+        existing.confidence = confidence
+        existing.verification = verification
+        return
+
+    session.add(
+        DecisionEvidence(
+            decision_id=decision_id,
+            source=source,
+            source_rank=source_rank,
+            evidence_file=evidence_file,
+            evidence_line=evidence_line,
+            evidence_commit=evidence_commit,
+            source_quote=source_quote,
+            confidence=confidence,
+            verification=verification,
+        )
+    )
+
+
+def _best_verification(values: list[str]) -> str:
+    """Reduce per-evidence verdicts to the strongest: exact > fuzzy > unverified."""
+    if "exact" in values:
+        return "exact"
+    if "fuzzy" in values:
+        return "fuzzy"
+    return "unverified"
+
+
+async def list_decision_evidence(
+    session: AsyncSession,
+    decision_id: str,
+) -> list[DecisionEvidence]:
+    """Return all evidence rows for a decision, highest source rank first."""
+    result = await session.execute(
+        select(DecisionEvidence)
+        .where(DecisionEvidence.decision_id == decision_id)
+        .order_by(DecisionEvidence.source_rank.desc(), DecisionEvidence.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+def _first_commit(d: dict) -> str | None:
+    commits = d.get("evidence_commits") or []
+    return commits[0] if commits else None
+
+
 async def bulk_upsert_decisions(
     session: AsyncSession,
     repository_id: str,
     decisions: list[dict],
-) -> None:
-    """Bulk upsert decision records from a list of dicts.
+    *,
+    vector_store: Any | None = None,
+) -> list[str]:
+    """Upsert decisions, accreting provenance instead of discarding losers.
 
-    Performs cross-source deduplication: if two decisions from different
-    sources have near-identical normalized titles, the one with higher
-    confidence wins and the other is skipped.
+    Decisions with near-identical normalized titles are merged into a single
+    :class:`DecisionRecord`; every contributing source becomes a
+    :class:`DecisionEvidence` row. The record's headline fields come from the
+    highest-``source_rank`` contributor, and its confidence is recomputed from
+    the best rank + the number of independently corroborating sources + the
+    strongest surviving verification verdict.
+
+    Idempotent: a full re-index converges (evidence rows upsert on their
+    natural key); an incremental update adds new evidence and re-derives the
+    headline + confidence from the union.
+
+    When *vector_store* (the shared page-generator store) is supplied, a
+    Phase-2C semantic pass augments the cheap normalized-title match: an
+    incoming group that matched no existing record by title is looked up in the
+    store, and if its nearest ``decision:`` neighbour clears the cosine
+    threshold it is folded into that record as additional evidence — so
+    paraphrases ("Use Redis" vs "Adopt Redis cache") collapse into one record.
+    Every touched record is (re-)embedded into the store, so decisions are
+    matchable next run *and* discoverable via ``search_codebase``.
+
+    Returns the ids of every record touched (created or updated) this call, so
+    a caller can run the Phase-3 supersession/conflict detection over just the
+    records that changed.
     """
-    # Cross-source dedup: group by normalized title, keep highest confidence
-    seen: dict[str, dict] = {}  # normalized_title → best decision dict
+    # Group incoming decisions by normalized title.
+    groups: dict[str, list[dict]] = {}
     for d in decisions:
-        title = d.get("title", "")
-        norm = _normalize_title(title)
+        norm = _normalize_title(d.get("title", ""))
         if not norm:
             continue
-        existing = seen.get(norm)
-        if existing is None:
-            seen[norm] = d
-        else:
-            # Keep the one with higher confidence; on tie, prefer more specific source
-            new_conf = d.get("confidence", 0.0)
-            old_conf = existing.get("confidence", 0.0)
-            if new_conf > old_conf:
-                seen[norm] = d
-            elif new_conf == old_conf:
-                # Prefer inline_marker > readme_mining > git_archaeology
-                source_priority = {"inline_marker": 3, "readme_mining": 2, "git_archaeology": 1}
-                if source_priority.get(d.get("source", ""), 0) > source_priority.get(
-                    existing.get("source", ""), 0
-                ):
-                    seen[norm] = d
+        groups.setdefault(norm, []).append(d)
 
-    deduped = list(seen.values())
+    if not groups:
+        return []
 
-    for i in range(0, len(deduped), _BATCH_SIZE):
-        batch = deduped[i : i + _BATCH_SIZE]
-        for d in batch:
-            await upsert_decision(
-                session,
+    # Map existing records (this repo) by normalized title so cross-run merges
+    # land on the same row. On a title collision keep the most authoritative
+    # existing row as canonical.
+    existing_rows = await session.execute(
+        select(DecisionRecord).where(DecisionRecord.repository_id == repository_id)
+    )
+    existing_by_norm: dict[str, DecisionRecord] = {}
+    for rec in existing_rows.scalars().all():
+        norm = _normalize_title(rec.title)
+        prior = existing_by_norm.get(norm)
+        if prior is None or rank_for_source(rec.source) > rank_for_source(prior.source):
+            existing_by_norm[norm] = rec
+
+    # Phase 2C semantic dedup runs against the shared vector store. ``id_to_rec``
+    # lets a store hit (which returns a decision id) resolve back to the live
+    # record, and is grown as records are created so paraphrases *within* one
+    # batch also collapse.
+    id_to_rec: dict[str, DecisionRecord] = {rec.id: rec for rec in existing_by_norm.values()}
+    if vector_store is not None:
+        from repowise.core.analysis.decision_semantic_match import (
+            find_duplicate_decision,
+            upsert_decision_vector,
+        )
+
+    touched_ids: list[str] = []
+
+    for norm, members in groups.items():
+        # Headline candidate: highest source rank, tie-break by confidence.
+        headline = max(
+            members,
+            key=lambda d: (rank_for_source(d.get("source", "")), d.get("confidence", 0.0)),
+        )
+        rec = existing_by_norm.get(norm)
+
+        # No title match → ask the store whether a semantically-equivalent
+        # decision already exists, and fold into it if so (cheap title dedup
+        # stays the first pass; this only runs on the residual).
+        if rec is None and vector_store is not None:
+            match_id = await find_duplicate_decision(
+                vector_store,
+                title=headline.get("title", ""),
+                decision=headline.get("decision") or "",
+            )
+            if match_id is not None and match_id in id_to_rec:
+                rec = id_to_rec[match_id]
+                existing_by_norm[norm] = rec
+
+        if rec is None:
+            rec = DecisionRecord(
+                id=_new_uuid(),
                 repository_id=repository_id,
-                title=d.get("title", ""),
-                status=d.get("status", "proposed"),
-                context=d.get("context") or "",
-                decision=d.get("decision") or "",
-                rationale=d.get("rationale") or "",
-                alternatives=d.get("alternatives"),
-                consequences=d.get("consequences"),
-                affected_files=d.get("affected_files"),
-                affected_modules=d.get("affected_modules"),
-                tags=d.get("tags"),
-                source=d.get("source", "cli"),
-                evidence_commits=d.get("evidence_commits"),
+                title=headline.get("title", ""),
+                status=headline.get("status", "proposed"),
+                context=headline.get("context") or "",
+                decision=headline.get("decision") or "",
+                rationale=headline.get("rationale") or "",
+                alternatives_json=json.dumps(headline.get("alternatives") or []),
+                consequences_json=json.dumps(headline.get("consequences") or []),
+                affected_files_json=json.dumps(headline.get("affected_files") or []),
+                affected_modules_json=json.dumps(headline.get("affected_modules") or []),
+                tags_json=json.dumps(headline.get("tags") or []),
+                evidence_commits_json=json.dumps(headline.get("evidence_commits") or []),
+                source=headline.get("source", "cli"),
+                evidence_file=headline.get("evidence_file"),
+                evidence_line=headline.get("evidence_line"),
+                confidence=headline.get("confidence", 0.5),
+            )
+            session.add(rec)
+            await session.flush()
+            existing_by_norm[norm] = rec
+            id_to_rec[rec.id] = rec
+        elif rank_for_source(headline.get("source", "")) >= rank_for_source(rec.source):
+            # A new contributor at least as authoritative as the current
+            # headline → promote its fields (provenance still accretes below).
+            rec.title = headline.get("title", rec.title)
+            rec.status = headline.get("status", rec.status)
+            rec.context = headline.get("context") or rec.context
+            rec.decision = headline.get("decision") or rec.decision
+            rec.rationale = headline.get("rationale") or rec.rationale
+            rec.alternatives_json = json.dumps(headline.get("alternatives") or [])
+            rec.consequences_json = json.dumps(headline.get("consequences") or [])
+            rec.affected_files_json = json.dumps(headline.get("affected_files") or [])
+            rec.affected_modules_json = json.dumps(headline.get("affected_modules") or [])
+            rec.tags_json = json.dumps(headline.get("tags") or [])
+            rec.evidence_commits_json = json.dumps(headline.get("evidence_commits") or [])
+            rec.source = headline.get("source", rec.source)
+            rec.evidence_file = headline.get("evidence_file")
+            rec.evidence_line = headline.get("evidence_line")
+
+        # Accrete one evidence row per contributing source occurrence.
+        for d in members:
+            src = d.get("source", "cli")
+            await _upsert_decision_evidence(
+                session,
+                rec.id,
+                source=src,
+                source_rank=rank_for_source(src),
                 evidence_file=d.get("evidence_file"),
                 evidence_line=d.get("evidence_line"),
-                confidence=d.get("confidence", 1.0),
-                staleness_score=d.get("staleness_score", 0.0),
-                superseded_by=d.get("superseded_by"),
+                evidence_commit=_first_commit(d),
+                source_quote=_evidence_quote(d),
+                confidence=d.get("confidence", 0.5),
+                verification=d.get("verification", "unverified"),
             )
+
+        # Re-derive headline confidence + verification from the FULL evidence
+        # set (existing + just-added), so corroboration accrues across runs.
+        evidence = await list_decision_evidence(session, rec.id)
+        if evidence:
+            distinct_sources = {e.source for e in evidence}
+            top_rank = max(e.source_rank for e in evidence)
+            best_ver = _best_verification([e.verification for e in evidence])
+            rec.confidence = compute_confidence(top_rank, len(distinct_sources), best_ver)
+            rec.verification = best_ver
+        rec.updated_at = _now_utc()
+        touched_ids.append(rec.id)
+
+        # Mirror the JSON file/module arrays into first-class decision→code
+        # links so the graph is traversable both directions (Phase 3A). The
+        # JSON stays the cheap read cache; these rows are the queryable truth.
+        await sync_decision_node_links(
+            session,
+            repository_id,
+            rec.id,
+            files=json.loads(rec.affected_files_json or "[]"),
+            modules=json.loads(rec.affected_modules_json or "[]"),
+        )
+
+        # (Re-)embed the record into the shared store so it's matchable by
+        # later groups in this batch + future runs, and discoverable via
+        # search_codebase. Best-effort — never blocks the SQL upsert.
+        if vector_store is not None:
+            await upsert_decision_vector(
+                vector_store,
+                rec.id,
+                title=rec.title,
+                decision=rec.decision or "",
+                evidence_file=rec.evidence_file,
+            )
+
+    await session.flush()
+    return touched_ids
 
 
 async def recompute_decision_staleness(
@@ -1599,11 +1826,32 @@ async def get_decision_health_summary(
     hotspot_files = {row[0] for row in hotspot_result.all()}
     ungoverned = sorted(hotspot_files - governed_files)
 
+    # Phase 3B: surface contradictory active decisions (conflicts_with edges).
+    from .decision_graph import list_conflict_edges
+
+    by_id = {d.id: d for d in all_decisions}
+    conflicts: list[dict] = []
+    for edge in await list_conflict_edges(session, repository_id):
+        src = by_id.get(edge.src_decision_id)
+        dst = by_id.get(edge.dst_decision_id)
+        if src is None or dst is None:
+            continue
+        conflicts.append(
+            {
+                "src": {"id": src.id, "title": src.title, "status": src.status},
+                "dst": {"id": dst.id, "title": dst.title, "status": dst.status},
+                "confidence": edge.confidence,
+                "evidence": edge.evidence,
+            }
+        )
+    counts["conflicts"] = len(conflicts)
+
     return {
         "summary": counts,
         "stale_decisions": stale_decisions,
         "proposed_awaiting_review": proposed_decisions,
         "ungoverned_hotspots": ungoverned,
+        "conflicts": conflicts,
     }
 
 
@@ -1969,6 +2217,88 @@ async def save_health_findings(
     )
     for row in existing.scalars().all():
         await session.delete(row)
+
+    for i in range(0, len(findings), _BATCH_SIZE):
+        batch = findings[i : i + _BATCH_SIZE]
+        for f in batch:
+            if hasattr(f, "biomarker_type"):
+                severity = f.severity
+                severity_str = str(severity.value) if hasattr(severity, "value") else str(severity)
+                data = {
+                    "file_path": f.file_path,
+                    "biomarker_type": f.biomarker_type,
+                    "severity": severity_str,
+                    "function_name": f.function_name,
+                    "line_start": f.line_start,
+                    "line_end": f.line_end,
+                    "details_json": json.dumps(f.details or {}),
+                    "health_impact": float(f.health_impact),
+                    "reason": f.reason or "",
+                }
+            else:
+                data = dict(f)
+                if "details" in data:
+                    data["details_json"] = json.dumps(data.pop("details") or {})
+
+            session.add(
+                HealthFinding(
+                    id=_new_uuid(),
+                    repository_id=repository_id,
+                    **{
+                        k: v
+                        for k, v in data.items()
+                        if k not in ("id", "repository_id") and hasattr(HealthFinding, k)
+                    },
+                )
+            )
+        await session.flush()
+
+
+_GOVERNANCE_BIOMARKER_TYPES = frozenset(
+    {"ungoverned_hotspot", "stale_governance", "contradictory_decision"}
+)
+
+
+async def replace_governance_findings(
+    session: AsyncSession,
+    repository_id: str,
+    findings: list[Any],
+) -> None:
+    """Idempotent additive write of governance-layer health findings.
+
+    Deletes any existing ``health_findings`` rows whose ``biomarker_type``
+    is one of ``ungoverned_hotspot``, ``stale_governance``, or
+    ``contradictory_decision`` for *repository_id*, then inserts the new
+    *findings* in batches.
+
+    This function deliberately does **not** recompute ``HealthFileMetric.score``
+    — that pass has already completed in the upstream health-analysis phase.
+    Governance findings surface through the findings layer (``get_risk``
+    ``top_biomarkers``, ``get_context`` health block) rather than the numeric
+    score.  A second score-recomputation pass would require re-loading the full
+    per-file results table; the conservative choice is to leave scores as-is
+    and let findings carry the governance signal.
+
+    Composable with ``save_health_findings``: the delete is scoped to only
+    the three governance biomarker types, so structural findings written by
+    ``save_health_findings`` are untouched.
+
+    Accepts ``HealthFindingData`` dataclasses or plain dicts (same protocol
+    as ``save_health_findings``).
+    """
+    # Delete existing governance findings for this repo only.
+    existing = await session.execute(
+        select(HealthFinding).where(
+            HealthFinding.repository_id == repository_id,
+            HealthFinding.biomarker_type.in_(list(_GOVERNANCE_BIOMARKER_TYPES)),
+        )
+    )
+    for row in existing.scalars().all():
+        await session.delete(row)
+    await session.flush()
+
+    if not findings:
+        return
 
     for i in range(0, len(findings), _BATCH_SIZE):
         batch = findings[i : i + _BATCH_SIZE]
@@ -2474,9 +2804,7 @@ async def get_coverage_summary(
 # ---------------------------------------------------------------------------
 
 
-async def upsert_kg_layers(
-    session: AsyncSession, repo_id: str, layers: list[dict]
-) -> None:
+async def upsert_kg_layers(session: AsyncSession, repo_id: str, layers: list[dict]) -> None:
     """Replace all KG layers for a repo (delete + bulk insert)."""
     await session.execute(
         delete(KnowledgeGraphLayer).where(KnowledgeGraphLayer.repository_id == repo_id)
@@ -2495,9 +2823,7 @@ async def upsert_kg_layers(
     await session.flush()
 
 
-async def get_kg_layers(
-    session: AsyncSession, repo_id: str
-) -> list[KnowledgeGraphLayer]:
+async def get_kg_layers(session: AsyncSession, repo_id: str) -> list[KnowledgeGraphLayer]:
     """Fetch all KG layers ordered by display_order."""
     result = await session.execute(
         select(KnowledgeGraphLayer)
@@ -2507,14 +2833,10 @@ async def get_kg_layers(
     return list(result.scalars())
 
 
-async def upsert_kg_tour_steps(
-    session: AsyncSession, repo_id: str, steps: list[dict]
-) -> None:
+async def upsert_kg_tour_steps(session: AsyncSession, repo_id: str, steps: list[dict]) -> None:
     """Replace all KG tour steps for a repo (delete + bulk insert)."""
     await session.execute(
-        delete(KnowledgeGraphTourStep).where(
-            KnowledgeGraphTourStep.repository_id == repo_id
-        )
+        delete(KnowledgeGraphTourStep).where(KnowledgeGraphTourStep.repository_id == repo_id)
     )
     for step in steps:
         session.add(
@@ -2529,9 +2851,7 @@ async def upsert_kg_tour_steps(
     await session.flush()
 
 
-async def get_kg_tour_steps(
-    session: AsyncSession, repo_id: str
-) -> list[KnowledgeGraphTourStep]:
+async def get_kg_tour_steps(session: AsyncSession, repo_id: str) -> list[KnowledgeGraphTourStep]:
     """Fetch all KG tour steps ordered by step_order."""
     result = await session.execute(
         select(KnowledgeGraphTourStep)

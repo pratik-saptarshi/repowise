@@ -196,6 +196,13 @@ class PipelineResult:
     knowledge_graph_result: Any | None = None
     """``KnowledgeGraphResult`` or None — populated after community detection."""
 
+    vector_store: Any | None = None
+    """The shared page-generator vector store used this run, threaded to
+    persistence so the decision semantic-dedup pass (Phase 2C) can match
+    against it and embed decisions into it (also surfacing them in
+    search_codebase). None when no store was configured (semantic dedup is
+    then skipped; title dedup still runs)."""
+
 
 # ---------------------------------------------------------------------------
 # Pipeline
@@ -468,8 +475,7 @@ async def run_pipeline(
                     )
 
         tech_stack_dicts = [
-            {"name": t.name, "version": t.version, "category": t.category}
-            for t in tech_items
+            {"name": t.name, "version": t.version, "category": t.category} for t in tech_items
         ]
 
         if knowledge_graph_result is None:
@@ -548,17 +554,17 @@ async def run_pipeline(
         )
 
     # ---- Knowledge Graph LLM enrichment (layer naming + tour) -----------------
-    if (
-        knowledge_graph_result is not None
-        and generate_docs
-        and llm_client is not None
-    ):
+    if knowledge_graph_result is not None and generate_docs and llm_client is not None:
         try:
             from repowise.core.generation.knowledge_graph import enrich_knowledge_graph
 
             if progress:
                 progress.on_phase_start("knowledge_graph.enrich", None)
-            _kg_reasoning = getattr(resolved_generation_config, "reasoning", "auto") if resolved_generation_config else "auto"
+            _kg_reasoning = (
+                getattr(resolved_generation_config, "reasoning", "auto")
+                if resolved_generation_config
+                else "auto"
+            )
             knowledge_graph_result = await enrich_knowledge_graph(
                 kg_skeleton=knowledge_graph_result,
                 llm_client=llm_client,
@@ -625,6 +631,7 @@ async def run_pipeline(
             {"name": t.name, "version": t.version, "category": t.category} for t in tech_items
         ],
         external_systems=external_systems,
+        vector_store=vector_store,
     )
 
 
@@ -1117,9 +1124,9 @@ async def _run_decision_extraction(
     try:
         from repowise.core.analysis.decision_extractor import DecisionExtractor
 
-        # Three sources run concurrently inside extract_all(); drive a
+        # Seven sources run concurrently inside extract_all(); drive a
         # determinate bar so users see live progress.
-        _DECISION_STEPS = 3
+        _DECISION_STEPS = 7
         if progress:
             progress.on_phase_start("decisions", _DECISION_STEPS)
 
@@ -1141,13 +1148,18 @@ async def _run_decision_extraction(
         )
 
         if progress:
-            inline = report.by_source.get("inline_marker", 0)
-            readme = report.by_source.get("readme_mining", 0)
-            git_arch = report.by_source.get("git_archaeology", 0)
-            total_decisions = inline + readme + git_arch
+            bs = report.by_source
+            total_decisions = report.total_found
             progress.on_message(
                 "info",
-                f"→ {total_decisions} decisions: {inline} inline · {readme} from docs · {git_arch} from git",
+                f"→ {total_decisions} decisions: "
+                f"{bs.get('inline_marker', 0)} inline · "
+                f"{bs.get('adr', 0)} ADR · "
+                f"{bs.get('changelog', 0)} changelog · "
+                f"{bs.get('pr', 0)} PR · "
+                f"{bs.get('git_archaeology', 0)} git · "
+                f"{bs.get('comment', 0)} comments · "
+                f"{bs.get('readme_mining', 0)} docs",
             )
 
         _phase_done(progress, "decisions")
