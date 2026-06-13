@@ -1,7 +1,12 @@
 const SEGMENT_LABELS: Record<string, string> = {
   overview: "Overview",
   docs: "Docs",
+  chat: "Chat",
+  architecture: "Architecture",
+  "code-health": "Code Health",
   coverage: "Coverage",
+  "refactoring-targets": "Refactoring Targets",
+  trend: "Trend",
   search: "Search",
   graph: "Graph",
   symbols: "Symbols",
@@ -10,11 +15,17 @@ const SEGMENT_LABELS: Record<string, string> = {
   "dead-code": "Dead Code",
   "blast-radius": "Blast Radius",
   decisions: "Decisions",
-  costs: "Costs",
+  commits: "Commits",
+  owners: "Contributors",
+  modules: "Modules",
+  wiki: "Wiki",
+  health: "Code Health",
+  costs: "Usage & Savings",
   risk: "Risk",
   security: "Security",
   settings: "Settings",
   c4: "Knowledge Graph",
+  files: "Files",
 };
 
 export function getRepoBreadcrumbSegmentLabel(segment: string): string {

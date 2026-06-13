@@ -1,6 +1,8 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { fileEntityPath } from "@repowise-dev/ui/shared/entity";
 import {
   GraphFlow as GraphFlowShell,
   type GraphFlowProps as GraphFlowShellProps,
@@ -34,6 +36,7 @@ export interface GraphFlowProps {
   repoId: string;
   repoName?: string;
   initialViewMode?: ViewMode;
+  initialColorMode?: GraphFlowShellProps["initialColorMode"];
   initialSelectedNode?: string | null;
   onNodeClick?: GraphFlowShellProps["onNodeClick"];
   onNodeViewDocs?: GraphFlowShellProps["onNodeViewDocs"];
@@ -45,18 +48,23 @@ export interface GraphFlowProps {
    *  track the current scope so it can conditionally fetch the capped full
    *  graph (and gate the truncation banner) only for scopes that render it. */
   onViewModeChange?: (mode: ViewMode) => void;
+  /** Fired when the node color mode changes so the page can sync the URL. */
+  onColorModeChange?: GraphFlowShellProps["onColorModeChange"];
 }
 
 export function GraphFlow({
   repoId,
   repoName,
   initialViewMode,
+  initialColorMode,
   initialSelectedNode,
   onNodeClick,
   onNodeViewDocs,
   onCommunityPanelOpen,
   onViewModeChange,
+  onColorModeChange,
 }: GraphFlowProps) {
+  const router = useRouter();
   // Constellation (Knowledge Graph) is the default scope.
   const [viewMode, setViewMode] = useState<ViewMode>(initialViewMode ?? "architecture");
   const [modulePath, setModulePath] = useState<string[]>([]);
@@ -124,15 +132,23 @@ export function GraphFlow({
       communities={communities as CommunitySummaryItem[] | undefined}
       executionFlows={executionFlowsData as ExecutionFlows | undefined}
       initialViewMode={initialViewMode}
+      initialColorMode={initialColorMode}
       initialSelectedNode={initialSelectedNode}
       onViewModeChange={(mode) => {
         setViewMode(mode);
         onViewModeChange?.(mode);
       }}
+      onColorModeChange={onColorModeChange}
       onModulePathChange={setModulePath}
       onExpandedModulesChange={(expanded) => setHasExpandedModules(expanded.size > 0)}
       onNodeClick={onNodeClick}
       onNodeViewDocs={onNodeViewDocs}
+      onNodeViewSymbols={(nodeId) =>
+        router.push(
+          `/repos/${repoId}/architecture?view=symbols&file=${encodeURIComponent(nodeId)}`,
+        )
+      }
+      fileHrefFor={(nodeId) => fileEntityPath(`/repos/${repoId}`, nodeId)}
       onCommunityPanelOpen={onCommunityPanelOpen}
       renderPathFinder={(props) => (
         <PathFinderPanel

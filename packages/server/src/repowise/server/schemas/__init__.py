@@ -57,7 +57,13 @@ from .decisions import (
     DecisionRecordResponse,
     DecisionStatusUpdate,
 )
+from .external_systems import (
+    ExternalSystemEntry,
+    ExternalSystemsResponse,
+)
 from .git import (
+    AgentTrendBucket,
+    AgentTrendResponse,
     CommitDetailResponse,
     CommitResponse,
     GitMetadataResponse,
@@ -102,6 +108,8 @@ from .intelligence import (
     SymbolNodeSummary,
 )
 from .ownership import (
+    GoverningDecisionRef,
+    OwnerAgentCollab,
     KnowledgeMapOwner,
     KnowledgeMapResponse,
     KnowledgeMapSilo,
@@ -164,6 +172,8 @@ from .workspace import (
 )
 
 __all__ = [
+    "AgentTrendBucket",
+    "AgentTrendResponse",
     "ArchEdgeResponse",
     "ArchLayerResponse",
     "ArchNodeResponse",
@@ -221,6 +231,8 @@ __all__ = [
     "EgoGraphResponse",
     "ExecutionFlowEntry",
     "ExecutionFlowsResponse",
+    "ExternalSystemEntry",
+    "ExternalSystemsResponse",
     "GitMetadataResponse",
     "GitSummaryResponse",
     "GraphEdgeResponse",
@@ -238,12 +250,14 @@ __all__ = [
     "KnowledgeMapTarget",
     "ModuleEdgeResponse",
     "ModuleGraphResponse",
+    "GoverningDecisionRef",
     "ModuleHealthDetail",
     "ModuleHealthOwner",
     "ModuleHealthSummary",
     "ModuleNodeResponse",
     "NeighboringCommunity",
     "NodeSearchResult",
+    "OwnerAgentCollab",
     "OwnerCoAuthor",
     "OwnerFileEntry",
     "OwnerListEntry",

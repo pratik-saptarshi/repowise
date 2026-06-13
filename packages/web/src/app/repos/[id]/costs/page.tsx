@@ -15,9 +15,8 @@ import {
 import { StatCard } from "@repowise-dev/ui/shared/stat-card";
 import { Card, CardContent, CardHeader, CardTitle } from "@repowise-dev/ui/ui/card";
 import { Skeleton } from "@repowise-dev/ui/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@repowise-dev/ui/ui/tabs";
+import { Tabs, ScrollableTabsList, TabsTrigger, TabsContent } from "@repowise-dev/ui/ui/tabs";
 import {
-  CacheHitRatioCard,
   CostHeatmap,
   DistillSavingsCard,
   ProviderComparison,
@@ -30,7 +29,7 @@ import { formatCost, formatNumber, formatTokens } from "@repowise-dev/ui/lib/for
 export default function CostsPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
-  const [tab, setTab] = useState("operations");
+  const [tab, setTab] = useState("daily");
 
   const { data: summary, isLoading: loadingSummary } = useSWR<CostSummary>(
     `costs-summary:${id}`,
@@ -79,13 +78,13 @@ export default function CostsPage() {
       <DistillSavingsCard data={distillSavings} />
 
       <Tabs value={tab} onValueChange={setTab} className="w-full">
-        <TabsList>
-          <TabsTrigger value="operations">Spend by operation</TabsTrigger>
+        <ScrollableTabsList>
           <TabsTrigger value="daily">Daily</TabsTrigger>
+          <TabsTrigger value="operations">Spend by operation</TabsTrigger>
           <TabsTrigger value="providers">Providers</TabsTrigger>
           <TabsTrigger value="hotspots">Hotspots</TabsTrigger>
-          <TabsTrigger value="cache">Cache</TabsTrigger>
-        </TabsList>
+          <TabsTrigger value="efficiency">Efficiency</TabsTrigger>
+        </ScrollableTabsList>
 
         <TabsContent value="daily" className="mt-4">
           <Card>
@@ -143,9 +142,11 @@ export default function CostsPage() {
           </Card>
         </TabsContent>
 
-        <TabsContent value="cache" className="mt-4">
+        {/* Cache analytics aren't wired to real data yet — the placeholder
+            CacheHitRatioCard is cut rather than shown empty; the tab keeps
+            the real per-call efficiency numbers. */}
+        <TabsContent value="efficiency" className="mt-4">
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <CacheHitRatioCard />
             <Card>
               <CardHeader className="pb-2">
                 <CardTitle className="text-sm">Token efficiency</CardTitle>

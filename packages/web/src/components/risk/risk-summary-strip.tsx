@@ -9,7 +9,7 @@ import { getDeadCodeSummary } from "@/lib/api/dead-code";
 import { getDecisionHealth } from "@/lib/api/decisions";
 import { listSecurityFindings } from "@/lib/api/security";
 
-const RISK_BASE = (repoId: string) => `/repos/${repoId}/risk`;
+const RISK_BASE = (repoId: string) => `/repos/${repoId}/code-health`;
 
 /**
  * Always-visible 5-card strip atop /repos/[id]/risk. Pulls cached SWR data
@@ -58,7 +58,7 @@ export function RiskSummaryStrip({ repoId }: { repoId: string }) {
         value={formatNumber(siloCount)}
         description="single-owner modules"
         icon={<Users className="h-4 w-4 text-amber-400" />}
-        href={`${RISK_BASE(repoId)}?tab=heatmap`}
+        href={`/repos/${repoId}/owners`}
       />
       <StatCard
         label="Reclaimable"
@@ -83,7 +83,7 @@ export function RiskSummaryStrip({ repoId }: { repoId: string }) {
             : "scan not run"
         }
         icon={<ShieldAlert className="h-4 w-4 text-red-400" />}
-        href={`/repos/${repoId}/security`}
+        href={`${RISK_BASE(repoId)}?tab=security`}
       />
     </div>
   );
